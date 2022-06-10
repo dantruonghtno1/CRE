@@ -27,6 +27,7 @@ Install Pytorch (suggestions>=1.7) and related environmental dependencies:
 
 ### Our improve
 Version 1: Using raw prototypes
-
+> python run_continual.py --dataname FewRel --protos_raw True
 Version 2: Multitask training with pareto in memory
+> python run_continual.py --dataname FewRel --multitask True
 
