@@ -11,6 +11,7 @@ import random
 from tqdm import tqdm, trange
 from sklearn.cluster import KMeans
 from .utils import osdist
+from .pareto import Pareto
 class Manager(object):
     def __init__(self, args):
         super().__init__()
@@ -189,6 +190,58 @@ class Manager(object):
             print(f"{name} loss is {np.array(losses).mean()}")
         for epoch_i in range(epochs):
             train_data(mem_loader, "memory_train_{}".format(epoch_i), is_mem=True)
+    
+    def train_mem_multitask_model(self, args, encoder, mem_data, proto_mem, epochs, seen_relations , memorized_samples = None, task4replay = None):
+        encoder.train()
+        optimizer = self.get_optimizer(args, encoder)
+        losses = []
+        
+        for epoch in range(epochs): 
+            for i in range(len(task4replay)):
+                loss_each_task = []
+                total_loss_each_task = 0
+                
+                task_relations = task4replay[i]
+                temp_rel2id = [self.rel2id[x] for x in seen_relations]
+                map_relid2tempid = {k:v for v,k in enumerate(temp_rel2id)}
+                map_tempid2relid = {k:v for k, v in map_relid2tempid.items()}
+                
+                replay_data_each_task = []
+                for relation in task_relations:
+                    if relation in seen_relations:
+                        replay_data_each_task += memorized_samples[relation]
+                
+                mem_loader = get_data_loader(args, replay_data_each_task, shuffle=True, drop_last=False, batch_size=2)
+                for step, batch_data in enumerate(mem_loader):
+                    labels, tokens, ind = batch_data
+                    labels = labels.to(args.device)
+                    tokens = torch.stack([x.to(args.device) for x in tokens], dim = 0)
+#                     print('tokens sample replay: ', tokens[0])
+#                     print('token replay size : ', tokens.size())
+                    
+                    zz, reps = encoder.bert_forward(tokens)
+                    loss = self.moment.loss(reps, labels, is_mem = True, mapping = map_relid2tempid)
+                    loss_each_task.append(loss.item())
+                    total_loss_each_task += loss
+                
+                avg_loss_each_task = total_loss_each_task/(1.0*len(loss_each_task))
+                print('loss each task : ', avg_loss_each_task)
+                losses.append(avg_loss_each_task)
+            if len(losses) > 1: 
+                print('---------------pareto----------------')
+                share_parameter = [p for n, p in encoder.named_parameters()]
+                n_tasks = len(losses)
+                pareto = Pareto(n_tasks)
+                weighted_loss = pareto.find_weighted_loss(losses = losses, parameters = share_parameter)
+                final_loss = 0
+                for l in range(len(losses)):
+                    final_loss += weighted_loss[l]*losses[l]
+                print('final loss : ', final_loss)
+                print('weighted : ', weighted_loss)
+                final_loss.backward()
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm)
+                optimizer.step()  
+                
     def kl_div_loss(self, x1, x2, t=10):
 
         batch_dist = F.softmax(t * x1, dim=1)
@@ -245,6 +298,8 @@ class Manager(object):
             
             history_relation = []
             proto4repaly = []
+            protos_raw = []
+
             for steps, (training_data, valid_data, test_data, current_relations, historic_test_data, seen_relations) in enumerate(sampler):
 
                 print(current_relations)
@@ -263,14 +318,20 @@ class Manager(object):
                 if len(memorized_samples)>0:
                     # select current task sample
                     for relation in current_relations:
-                        memorized_samples[relation], _, _ = self.select_data(args, encoder, training_data[relation])
+                        memorized_samples[relation], _, proto_raw = self.select_data(args, encoder, training_data[relation])
+                        protos_raw.append(protos_raw)
                     
                     train_data_for_memory = []
                     for relation in history_relation:
                         train_data_for_memory += memorized_samples[relation]
                     
                     self.moment.init_moment(args, encoder, train_data_for_memory, is_memory=True)
-                    self.train_mem_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations)
+
+                    if args.protos_raw == True:
+                        self.train_mem_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations)
+                    else:
+                        self.train_mem_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations)
+                        
 
                 feat_mem = []
                 proto_mem = []

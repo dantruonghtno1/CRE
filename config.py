@@ -75,5 +75,7 @@ class Param:
 
         # bert-base-uncased weights path
         parser.add_argument("--bert_path", default="bert-base-uncased")
+
+        parser.add_argument("--protos_raw", default=True, type = bool)
         
         return parser
