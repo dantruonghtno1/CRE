@@ -1,4 +1,5 @@
 import argparse
+from email.policy import default
 import os
 """
 Detailed hyper-parameter configurations.
@@ -77,5 +78,8 @@ class Param:
         parser.add_argument("--bert_path", default="bert-base-uncased")
 
         parser.add_argument("--protos_raw", default=True, type = bool)
+
+        # multitask 
+        parser.add_argument("--multitask", default = True, type = bool)
         
         return parser

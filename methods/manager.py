@@ -197,6 +197,7 @@ class Manager(object):
         losses = []
         
         for epoch in range(epochs): 
+            # -----------------------------------------start multitask ---------------------------------------------
             for i in range(len(task4replay)):
                 loss_each_task = []
                 total_loss_each_task = 0
@@ -211,8 +212,8 @@ class Manager(object):
                     if relation in seen_relations:
                         replay_data_each_task += memorized_samples[relation]
                 
-                mem_loader = get_data_loader(args, replay_data_each_task, shuffle=True, drop_last=False, batch_size=2)
-                for step, batch_data in enumerate(mem_loader):
+                mem_task_loader = get_data_loader(args, replay_data_each_task, shuffle=True, drop_last=False, batch_size=2)
+                for step, batch_data in enumerate(mem_task_loader):
                     labels, tokens, ind = batch_data
                     labels = labels.to(args.device)
                     tokens = torch.stack([x.to(args.device) for x in tokens], dim = 0)
@@ -241,7 +242,55 @@ class Manager(object):
                 final_loss.backward()
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm)
                 optimizer.step()  
-                
+            #  ----------------------------------------end multitask -----------------------------------------------
+            
+
+            # -----------------------------------------start distillation ------------------------------------------
+            history_nums = len(seen_relations) - args.rel_per_task
+            if len(proto_mem)>0:
+                proto_mem = F.normalize(proto_mem, p =2, dim=1)
+                dist = dot_dist(proto_mem, proto_mem)
+                dist = dist.to(args.device)
+
+            mem_loader = get_data_loader(args, mem_data, shuffle=True)
+            encoder.train()
+            temp_rel2id = [self.rel2id[x] for x in seen_relations]
+            map_relid2tempid = {k:v for v,k in enumerate(temp_rel2id)}
+            map_tempid2relid = {k:v for k, v in map_relid2tempid.items()}
+            optimizer = self.get_optimizer(args, encoder)
+ 
+            kl_losses = []
+            for step, batch_data in enumerate(mem_loader):
+                optimizer.zero_grad()
+                labels, tokens, ind = batch_data
+                labels = labels.to(args.device)
+                tokens = torch.stack([x.to(args.device) for x in tokens], dim=0)
+                zz, reps = encoder.bert_forward(tokens)
+                hidden = reps
+                need_ratio_compute = ind < history_nums * args.num_protos
+                total_need = need_ratio_compute.sum()
+                    
+                if total_need > 0 :
+                    # Knowledge Distillation for Relieve Forgetting
+                    need_ind = ind[need_ratio_compute]
+                    need_labels = labels[need_ratio_compute]
+                    temp_labels = [map_relid2tempid[x.item()] for x in need_labels]
+                    gold_dist = dist[temp_labels]
+                    current_proto = self.moment.get_mem_proto()[:history_nums]
+                    this_dist = dot_dist(hidden[need_ratio_compute], current_proto.to(args.device))
+                    loss1 = self.kl_div_loss(gold_dist, this_dist, t=args.kl_temp)
+                    loss1.backward(retain_graph=True)
+                else:
+                    loss1 = 0.0
+
+                # if isinstance(loss1, float):
+                #     kl_losses.append(loss1)
+                # else:
+                #     kl_losses.append(loss1.item())
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm)
+                optimizer.step()
+            # ---------------------------------end distillation ------------------------------------
+
     def kl_div_loss(self, x1, x2, t=10):
 
         batch_dist = F.softmax(t * x1, dim=1)
@@ -299,7 +348,7 @@ class Manager(object):
             history_relation = []
             proto4repaly = []
             protos_raw = []
-
+            task4replay = []
             for steps, (training_data, valid_data, test_data, current_relations, historic_test_data, seen_relations) in enumerate(sampler):
 
                 print(current_relations)
@@ -319,20 +368,25 @@ class Manager(object):
                     # select current task sample
                     for relation in current_relations:
                         memorized_samples[relation], _, proto_raw = self.select_data(args, encoder, training_data[relation])
-                        protos_raw.append(protos_raw)
-                    
+                        protos_raw.append(proto_raw)
+                    task4replay.append(current_relations)
+
                     train_data_for_memory = []
                     for relation in history_relation:
                         train_data_for_memory += memorized_samples[relation]
                     
                     self.moment.init_moment(args, encoder, train_data_for_memory, is_memory=True)
-
-                    if args.protos_raw == True:
-                        self.train_mem_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations)
+                    
+                    if args.multitask == False:
+                        if args.protos_raw == True:
+                            self.train_mem_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations)
+                        else:
+                            self.train_mem_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations)
                     else:
-                        self.train_mem_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations)
-                        
-
+                        if args.protos_raw == True:
+                            self.train_mem_multitask_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations, memorized_samples, task4replay)
+                        else:
+                            self.train_mem_multitask_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations, memorized_samples, task4replay)
                 feat_mem = []
                 proto_mem = []
 
