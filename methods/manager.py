@@ -290,6 +290,41 @@ class Manager(object):
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm)
                 optimizer.step()
             # ---------------------------------end distillation ------------------------------------
+    def protoAug_PASS(proto4task, feature4task, radius = None, num_sample_per_proto = 100, task_index = 0, num_rel_per_task = 8, protoAug = None):
+        """
+            Generate sample from prototype:
+            input: 
+                proto4task: 
+                feature4task: 
+                radius: float 
+                num_sample_per_proto: int
+            return:
+                protoAug: dict
+                radius: float
+        """
+
+        # step 1: update radius 
+        # assume feature4task is dict[relation, list[features]]
+        task_radius = []
+        for relation in feature4task:
+            feature4task[relation] = np.array(feature4task[relation])
+            # [num_sanpler x hidden_dim]
+            feature_dim = feature4task[relation].shape[-1]
+            cov = np.cov(feature4task[relation].T)
+            task_radius.append(np.trace(cov)/feature_dim)
+        
+        radius = 1.0/(num_rel_per_task*(task_index+1))(task_index*radius + np.sum(task_radius))
+        r = np.sqrt(radius)
+                    
+        # step 2: generate radius for each task. 
+        for relation in feature4task:
+            for _ in range(num_sample_per_proto):
+                temp = np.array(proto4task[relation])
+                temp += np.random.normal(0, 1, temp.shape[-1])*r
+                protoAug[relation].append(temp)
+        return protoAug, radius
+            
+
 
     def kl_div_loss(self, x1, x2, t=10):
 
