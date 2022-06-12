@@ -32,3 +32,5 @@ Version 1: Using raw prototypes
 Version 2: Multitask training with pareto in memory
 > python run_continual.py --dataname FewRel --multitask True
 
+Version 3: Memory augmentation
+> python run_continual.py --dataname FewRel --multitask False --protoAug True
