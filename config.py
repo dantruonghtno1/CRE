@@ -81,5 +81,8 @@ class Param:
 
         # multitask 
         parser.add_argument("--multitask", default = True, type = bool)
+
+        # proto Aug
+        parser.add_argument("--protoAug", default = False, type = bool)
         
         return parser

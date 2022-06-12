@@ -290,41 +290,121 @@ class Manager(object):
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm)
                 optimizer.step()
             # ---------------------------------end distillation ------------------------------------
-    def protoAug_PASS(proto4task, feature4task, radius = None, num_sample_per_proto = 100, task_index = 0, num_rel_per_task = 8, protoAug = None):
+    def protoAug_PASS(self, proto4task, feature4task, radius = None, num_sample_per_proto = 100, task_index = 0, num_rel_per_task = 8, seen_relations = None):
         """
             Generate sample from prototype:
             input: 
-                proto4task: 
-                feature4task: 
+                proto4task: contain prototypes of memory
+                    dict[relation, proto]
+                feature4task: dict[relation, list[feature]]
                 radius: float 
                 num_sample_per_proto: int
             return:
-                protoAug: dict
+                protoAug: list[dict{relation:int, tokens:list}]
                 radius: float
         """
-
         # step 1: update radius 
         # assume feature4task is dict[relation, list[features]]
         task_radius = []
         for relation in feature4task:
-            feature4task[relation] = np.array(feature4task[relation])
+            feature_of_rel = np.array(feature4task[relation])
             # [num_sanpler x hidden_dim]
-            feature_dim = feature4task[relation].shape[-1]
-            cov = np.cov(feature4task[relation].T)
+            feature_dim = feature_of_rel.shape[-1]
+            cov = np.cov(feature_of_rel.T)
             task_radius.append(np.trace(cov)/feature_dim)
         
-        radius = 1.0/(num_rel_per_task*(task_index+1))(task_index*radius + np.sum(task_radius))
+        radius = (1.0/(num_rel_per_task*(task_index+1)))*(task_index*radius + np.sum(task_radius))
         r = np.sqrt(radius)
-                    
+
+        protoAug = []
         # step 2: generate radius for each task. 
-        for relation in feature4task:
+        for relation in seen_relations:
             for _ in range(num_sample_per_proto):
+                # temp : proto relation 
                 temp = np.array(proto4task[relation])
+                # add noise 
                 temp += np.random.normal(0, 1, temp.shape[-1])*r
-                protoAug[relation].append(temp)
+                protoAug.append({'relation':self.rel2id[relation], 'tokens':temp})
         return protoAug, radius
             
 
+    def train_mem_with_protoAug_model(self, args, encoder, mem_data, proto_mem, epochs, seen_relations):
+        history_nums = len(seen_relations) - args.rel_per_task
+        if len(proto_mem)>0:
+            
+            proto_mem = F.normalize(proto_mem, p =2, dim=1)
+            dist = dot_dist(proto_mem, proto_mem)
+            dist = dist.to(args.device)
+
+        mem_loader = get_data_loader(args, mem_data, shuffle=True)
+        encoder.train()
+        temp_rel2id = [self.rel2id[x] for x in seen_relations]
+        map_relid2tempid = {k:v for v,k in enumerate(temp_rel2id)}
+        map_tempid2relid = {k:v for k, v in map_relid2tempid.items()}
+        optimizer = self.get_optimizer(args, encoder)
+        def train_data(data_loader_, name = "", is_mem = False):
+            losses = []
+            kl_losses = []
+            td = tqdm(data_loader_, desc=name)
+            for step, batch_data in enumerate(td):
+
+                optimizer.zero_grad()
+                labels, tokens, ind = batch_data
+                labels = labels.to(args.device)
+                tokens = torch.stack([x.to(args.device) for x in tokens], dim=0)
+                reps = nn.LayerNorm(tokens)
+
+                # zz, reps = encoder.bert_forward(tokens)
+                hidden = reps
+
+
+                need_ratio_compute = ind < history_nums * args.num_protos
+                total_need = need_ratio_compute.sum()
+                
+                if total_need >0 :
+                    # Knowledge Distillation for Relieve Forgetting
+                    need_ind = ind[need_ratio_compute]
+                    need_labels = labels[need_ratio_compute]
+                    temp_labels = [map_relid2tempid[x.item()] for x in need_labels]
+                    gold_dist = dist[temp_labels]
+                    current_proto = self.moment.get_mem_proto()[:history_nums]
+                    this_dist = dot_dist(hidden[need_ratio_compute], current_proto.to(args.device))
+                    loss1 = self.kl_div_loss(gold_dist, this_dist, t=args.kl_temp)
+                    loss1.backward(retain_graph=True)
+                else:
+                    loss1 = 0.0
+
+                #  Contrastive Replay
+                cl_loss = self.moment.loss(reps, labels, is_mem=True, mapping=map_relid2tempid)
+
+                if isinstance(loss1, float):
+                    kl_losses.append(loss1)
+                else:
+                    kl_losses.append(loss1.item())
+                loss = cl_loss
+                if isinstance(loss, float):
+                    losses.append(loss)
+                    td.set_postfix(loss = np.array(losses).mean(),  kl_loss = np.array(kl_losses).mean())
+                    # update moemnt
+                    if is_mem:
+                        self.moment.update_mem(ind, reps.detach(), hidden.detach())
+                    else:
+                        self.moment.update(ind, reps.detach())
+                    continue
+                losses.append(loss.item())
+                td.set_postfix(loss = np.array(losses).mean(),  kl_loss = np.array(kl_losses).mean())
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm)
+                optimizer.step()
+                
+                # update moemnt
+                if is_mem:
+                    self.moment.update_mem(ind, reps.detach())
+                else:
+                    self.moment.update(ind, reps.detach())
+            print(f"{name} loss is {np.array(losses).mean()}")
+        for epoch_i in range(epochs):
+            train_data(mem_loader, "memory_train_{}".format(epoch_i), is_mem=True)
 
     def kl_div_loss(self, x1, x2, t=10):
 
@@ -379,11 +459,16 @@ class Manager(object):
             memorized_samples = {}
 
             # load data and start computation
-            
             history_relation = []
-            proto4repaly = []
+            proto4repaly = []   
             protos_raw = []
             task4replay = []
+
+            if args.protoAug == True:
+                protoDict4replay = {}
+                feature4task = {}
+                radius = 0
+
             for steps, (training_data, valid_data, test_data, current_relations, historic_test_data, seen_relations) in enumerate(sampler):
 
                 print(current_relations)
@@ -392,6 +477,7 @@ class Manager(object):
                 for relation in current_relations:
                     history_relation.append(relation)
                     train_data_for_initial += training_data[relation]
+
                 # train model
                 # no memory. first train with current task
                 self.moment = Moment(args)
@@ -399,11 +485,16 @@ class Manager(object):
                 self.train_simple_model(args, encoder, train_data_for_initial, args.step1_epochs)
 
                 # repaly
+                feature4task = {}
                 if len(memorized_samples)>0:
                     # select current task sample
                     for relation in current_relations:
-                        memorized_samples[relation], _, proto_raw = self.select_data(args, encoder, training_data[relation])
+                        memorized_samples[relation], current_feat, proto_raw = self.select_data(args, encoder, training_data[relation])
                         protos_raw.append(proto_raw)
+                        if args.protoAug == True:
+                            protoDict4replay[relation] = proto_raw
+                            feature4task[relation] = current_feat                            
+                    
                     task4replay.append(current_relations)
 
                     train_data_for_memory = []
@@ -412,16 +503,20 @@ class Manager(object):
                     
                     self.moment.init_moment(args, encoder, train_data_for_memory, is_memory=True)
                     
-                    if args.multitask == False:
-                        if args.protos_raw == True:
-                            self.train_mem_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations)
+                    if args.protoAug == False:
+                        if args.multitask == False:
+                            if args.protos_raw == True:
+                                self.train_mem_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations)
+                            else:
+                                self.train_mem_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations)
                         else:
-                            self.train_mem_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations)
+                            if args.protos_raw == True:
+                                self.train_mem_multitask_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations, memorized_samples, task4replay)
+                            else:
+                                self.train_mem_multitask_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations, memorized_samples, task4replay)
                     else:
-                        if args.protos_raw == True:
-                            self.train_mem_multitask_model(args, encoder, train_data_for_memory, protos_raw, args.step2_epochs, seen_relations, memorized_samples, task4replay)
-                        else:
-                            self.train_mem_multitask_model(args, encoder, train_data_for_memory, proto4repaly, args.step2_epochs, seen_relations, memorized_samples, task4replay)
+                        protoAug, radius = self.protoAug_PASS(protoDict4replay, feature4task, radius, 100, steps + 1, 8, seen_relations)
+                        self.train_mem_with_protoAug_model(args, encoder, protoAug, proto_mem, args.step2_epochs, seen_relations)
                 feat_mem = []
                 proto_mem = []
 
